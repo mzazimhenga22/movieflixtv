@@ -50,6 +50,7 @@ dependencies:
   encrypt: ^5.0.3
   flutter_local_notifications: ^17.0.0
   flutter_webrtc: 0.14.0
+  system_info: ^1.0.1
 
 
   # Storage & Database
