@@ -71,60 +71,30 @@ class StreamingService {
 
       final decodedRaw = jsonDecode(response.body);
       if (decodedRaw is! Map<String, dynamic>) {
-        _logger.e('Invalid response format (not a JSON object): $decodedRaw');
+        _logger.e('Invalid response format: $decodedRaw');
         throw StreamingNotAvailableException('Invalid response format.');
       }
+
       final decoded = Map<String, dynamic>.from(decodedRaw);
-
-      dynamic raw = decoded['streams'];
-      if (raw == null && decoded.containsKey('stream')) {
-        raw = [decoded['stream']];
-      }
+      dynamic raw = decoded['streams'] ?? (decoded.containsKey('stream') ? [decoded['stream']] : null);
       if (raw == null) {
-        _logger.e('Invalid response format: $decoded');
-        throw StreamingNotAvailableException('Invalid response format.');
-      }
-
-      final streams = List<Map<String, dynamic>>.from(raw);
-      if (streams.isEmpty) {
-        _logger.w('No streams found');
+        _logger.e('No streams found: $decoded');
         throw StreamingNotAvailableException('No streaming links available.');
       }
 
+      final streams = List<Map<String, dynamic>>.from(raw);
+      if (streams.isEmpty) throw StreamingNotAvailableException('No streams available.');
+
       Map<String, dynamic> selectedStream;
+
       if (resolution == "auto") {
-        // Find HLS streams
-        List<Map<String, dynamic>> hlsStreams = streams.where((s) {
+        List<Map<String, dynamic>> hls = streams.where((s) {
           final type = s['type'] as String?;
           final url = s['url'] as String?;
           return type == 'm3u8' || (url != null && url.endsWith('.m3u8'));
         }).toList();
-
-        if (hlsStreams.isNotEmpty) {
-          selectedStream = hlsStreams.first;
-        } else {
-          // Find non-HLS streams
-          List<Map<String, dynamic>> nonHlsStreams = streams.where((s) {
-            final type = s['type'] as String?;
-            final url = s['url'] as String?;
-            return type != 'm3u8' && (url == null || !url.endsWith('.m3u8'));
-          }).toList();
-
-          if (nonHlsStreams.isEmpty) {
-            throw StreamingNotAvailableException(
-                'No streaming links available.');
-          }
-
-          // Sort by resolution descending
-          nonHlsStreams.sort((a, b) => _parseResolution(b['resolution'])
-              .compareTo(_parseResolution(a['resolution'])));
-          selectedStream = nonHlsStreams.first;
-        }
+        selectedStream = hls.isNotEmpty ? hls.first : streams.first;
       } else {
-        if (streams.isEmpty) {
-          throw StreamingNotAvailableException(
-              'No streaming links available for the specified resolution.');
-        }
         selectedStream = streams.first;
       }
 
@@ -133,85 +103,60 @@ class StreamingService {
       String streamUrl = '';
       String subtitleUrl = '';
 
-      // Handle base64-encoded M3U8 playlist
       final playlistEncoded = selectedStream['playlist'] as String?;
-      if (playlistEncoded != null &&
-          playlistEncoded
-              .startsWith('data:application/vnd.apple.mpegurl;base64,')) {
+      if (playlistEncoded != null && playlistEncoded.startsWith('data:application/vnd.apple.mpegurl;base64,')) {
         final base64Part = playlistEncoded.split(',')[1];
         playlist = utf8.decode(base64Decode(base64Part));
-        _logger.i('Decoded M3U8 playlist:\n$playlist');
 
         if (kIsWeb) {
           final bytes = base64Decode(base64Part);
           final blob = html.Blob([bytes], 'application/vnd.apple.mpegurl');
           streamUrl = html.Url.createObjectUrlFromBlob(blob);
         } else {
-          final file = File(
-              '${(await getTemporaryDirectory()).path}/$tmdbId-playlist.m3u8');
+          final file = File('${(await getTemporaryDirectory()).path}/$tmdbId-playlist.m3u8');
           await file.writeAsString(playlist);
           streamUrl = file.path;
         }
-        streamType = 'm3u8';
       } else {
         final urlValue = selectedStream['url']?.toString();
         if (urlValue == null || urlValue.isEmpty) {
-          _logger.e('No stream URL provided: $selectedStream');
           throw StreamingNotAvailableException('No stream URL available.');
         }
         streamUrl = urlValue;
 
-        if (streamUrl.endsWith('.m3u8')) {
-          streamType = 'm3u8';
-          if (forDownload) {
-            final playlistResponse = await http.get(Uri.parse(streamUrl));
-            if (playlistResponse.statusCode == 200) {
-              playlist = playlistResponse.body;
-              if (!kIsWeb) {
-                final file = File(
-                    '${(await getTemporaryDirectory()).path}/$tmdbId-playlist.m3u8');
-                await file.writeAsString(playlist);
-                streamUrl = file.path;
-              }
-            } else {
-              _logger.e(
-                  'Failed to fetch M3U8 playlist: ${playlistResponse.statusCode}');
-              throw StreamingNotAvailableException('Failed to fetch playlist.');
-            }
+        if (streamUrl.endsWith('.m3u8') && forDownload && !kIsWeb) {
+          final playlistResponse = await http.get(Uri.parse(streamUrl));
+          if (playlistResponse.statusCode == 200) {
+            final file = File('${(await getTemporaryDirectory()).path}/$tmdbId-playlist.m3u8');
+            await file.writeAsString(playlistResponse.body);
+            streamUrl = file.path;
           }
-        } else if (streamUrl.endsWith('.mp4')) {
-          streamType = 'mp4';
-        } else {
-          streamType = selectedStream['type']?.toString() ?? 'm3u8';
         }
+        streamType = streamUrl.endsWith('.mp4') ? 'mp4' : 'm3u8';
       }
 
-      // Handle subtitles
       final captionsList = selectedStream['captions'] as List<dynamic>?;
       if (enableSubtitles && captionsList != null && captionsList.isNotEmpty) {
         final selectedCap = captionsList.firstWhere(
           (c) => c['language'] == 'en',
           orElse: () => captionsList.first,
         );
-        subtitleUrl = selectedCap['url']?.toString() ?? '';
-        if (forDownload && subtitleUrl.isNotEmpty) {
+
+        final srtUrl = selectedCap['url']?.toString() ?? '';
+        if (srtUrl.isNotEmpty && !kIsWeb) {
           try {
-            final subtitleResponse = await http.get(Uri.parse(subtitleUrl));
+            final subtitleResponse = await http.get(Uri.parse(srtUrl));
             if (subtitleResponse.statusCode == 200) {
-              if (!kIsWeb) {
-                final subtitleFile = File(
-                    '${(await getTemporaryDirectory()).path}/$tmdbId-subtitles.srt');
-                await subtitleFile.writeAsBytes(subtitleResponse.bodyBytes);
-                subtitleUrl = subtitleFile.path;
-              }
-            } else {
-              _logger.w(
-                  'Failed to download subtitles: ${subtitleResponse.statusCode}');
-              subtitleUrl = '';
+              final srtContent = utf8.decode(subtitleResponse.bodyBytes);
+              final vttContent = _convertSrtToVtt(srtContent);
+
+              final vttFile = File('${(await getTemporaryDirectory()).path}/$tmdbId-subtitles.vtt');
+              await vttFile.writeAsString(vttContent);
+
+              subtitleUrl = vttFile.path;
             }
           } catch (e) {
-            _logger.w('Error downloading subtitles: $e');
-            subtitleUrl = '';
+            _logger.w('Failed to convert/download subtitles: $e');
           }
         }
       }
@@ -221,20 +166,38 @@ class StreamingService {
         'type': streamType,
         'title': title,
       };
-      if (playlist != null) {
-        result['playlist'] = playlist;
-      }
-      if (subtitleUrl.isNotEmpty) {
-        result['subtitleUrl'] = subtitleUrl;
-      }
+      if (playlist != null) result['playlist'] = playlist;
+      if (subtitleUrl.isNotEmpty) result['subtitleUrl'] = subtitleUrl;
 
-      _logger.i('Streaming link retrieved: $result');
       return result;
     } catch (e, st) {
-      _logger.e('Error fetching stream for tmdbId: $tmdbId',
-          error: e, stackTrace: st);
+      _logger.e('Error fetching stream: $e', stackTrace: st);
       rethrow;
     }
   }
-}
+
+  /// Converts SRT subtitles to VTT format.
+  static String _convertSrtToVtt(String srtContent) {
+    final lines = srtContent.split('\n');
+    final buffer = StringBuffer()..writeln('WEBVTT\n');
+
+    for (int i = 0; i < lines.length; i++) {
+      final line = lines[i].trim();
+
+      if (RegExp(r'^\d+$').hasMatch(line)) {
+        // Skip subtitle index line
+        continue;
+      } else if (line.contains('-->')) {
+        buffer.writeln(
+          line.replaceAll(',', '.'), // Convert SRT time format to VTT
+        );
+      } else {
+        buffer.writeln(line);
+      }
+    }
+
+    return buffer.toString().trim();
+  }
+} 
+
 
