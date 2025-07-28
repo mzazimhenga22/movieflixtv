@@ -10,6 +10,8 @@ import 'package:movie_app/streaming_service.dart';
 import 'dart:io';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:system_info/system_info.dart';
 
 class Subtitle {
   final Duration start;
@@ -50,6 +52,11 @@ class MainVideoPlayer extends StatefulWidget {
   @override
   MainVideoPlayerState createState() => MainVideoPlayerState();
 }
+
+final int cpuCores = SysInfo.processors.length;
+final int totalRam = SysInfo.getTotalPhysicalMemory();
+ // This is async
+
 
 class MainVideoPlayerState extends State<MainVideoPlayer>
     with WidgetsBindingObserver {
@@ -212,6 +219,10 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
             'User-Agent':
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           },
+          videoPlayerOptions: VideoPlayerOptions(
+            allowBackgroundPlayback: false,
+            mixWithOthers: false,
+          ),
         );
       }
 
@@ -228,6 +239,7 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
         }
         await _controller.play();
         await _controller.setPlaybackSpeed(_playbackSpeed);
+        _adjustQualityBasedOnHardware();
       }
     } catch (error) {
       if (mounted) {
@@ -250,6 +262,39 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
       }
     }
   }
+
+Future<void> _adjustQualityBasedOnHardware() async {
+  try {
+    final deviceInfo = DeviceInfoPlugin();
+    bool isHighEndTV = false;
+
+    if (Platform.isAndroid) {
+      final androidInfo = await deviceInfo.androidInfo;
+      final sdkInt = androidInfo.version.sdkInt;
+
+      final int cpuCores = SysInfo.processors.length;
+      final int totalRam = SysInfo.getTotalPhysicalMemory();
+
+      // Example threshold for high-end Android TV
+      isHighEndTV = sdkInt >= 30 && cpuCores >= 4 && totalRam >= (2 * 1024 * 1024 * 1024);
+    } else {
+      isHighEndTV = true; // Assume high end for iOS, desktop, etc.
+    }
+
+    if (isHighEndTV && _selectedQuality != "1080p") {
+      setState(() => _selectedQuality = "1080p");
+      await _fetchNewQualityStream("1080p");
+    } else if (!isHighEndTV && _selectedQuality != "720p" && _selectedQuality != "480p") {
+      setState(() => _selectedQuality = "720p");
+      await _fetchNewQualityStream("720p");
+    }
+  } catch (e) {
+    debugPrint('Error adjusting quality: $e');
+  }
+}
+
+
+
 
   String? _getNextLowerQuality(String currentQuality) {
     switch (currentQuality) {
@@ -299,55 +344,70 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
     }
   }
 
-  Future<void> _loadSubtitles() async {
-    if (widget.isLocal && widget.localSubtitlePath != null) {
-      try {
-        final file = File(widget.localSubtitlePath!);
-        if (await file.exists()) {
-          final srt = await file.readAsString();
-          if (mounted) {
-            setState(() {
-              _subtitles = _parseSrt(srt);
-            });
-          }
-        } else {
-          debugPrint('Local subtitle file not found');
-        }
-      } catch (e) {
-        debugPrint('Failed to load local subtitles: $e');
+Future<void> _loadSubtitles() async {
+  String? content;
+  if (widget.isLocal && widget.localSubtitlePath != null) {
+    try {
+      final file = File(widget.localSubtitlePath!);
+      if (await file.exists()) {
+        content = await file.readAsString();
+      } else {
+        debugPrint('Local subtitle file not found');
       }
-    } else if (widget.subtitleUrl != null && widget.subtitleUrl!.isNotEmpty) {
-      try {
-        final response = await http.get(Uri.parse(widget.subtitleUrl!));
-        if (response.statusCode == 200) {
-          if (mounted) {
-            setState(() {
-              _subtitles = _parseSrt(response.body);
-            });
-          }
-        } else {
-          debugPrint(
-              'Failed to fetch network subtitles: ${response.statusCode}');
-        }
-      } catch (e) {
-        debugPrint('Failed to load network subtitles: $e');
+    } catch (e) {
+      debugPrint('Failed to load local subtitles: $e');
+    }
+  } else if (widget.subtitleUrl != null && widget.subtitleUrl!.isNotEmpty) {
+    try {
+      final response = await http.get(Uri.parse(widget.subtitleUrl!));
+      if (response.statusCode == 200) {
+        content = utf8.decode(response.bodyBytes);
+      } else {
+        debugPrint('Failed to fetch network subtitles: ${response.statusCode}');
       }
+    } catch (e) {
+      debugPrint('Failed to load network subtitles: $e');
     }
   }
+if (content != null && mounted) {
+  final subtitleText = content; // now treated as non-null
+  setState(() {
+    _subtitles = subtitleText.startsWith('WEBVTT')
+        ? _parseVtt(subtitleText)
+        : _parseSrt(subtitleText);
+  });
+}
 
-  List<Subtitle> _parseSrt(String srt) {
-    final List<Subtitle> subtitles = [];
-    final regex = RegExp(
-        r'(\d+)\s+(\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2},\d{3})\s+([\s\S]*?)(?=\n\n|\$)');
-    final matches = regex.allMatches(srt);
-    for (final match in matches) {
-      final start = _parseDuration(match.group(2)!);
-      final end = _parseDuration(match.group(3)!);
-      final text = match.group(4)!.trim().replaceAll('\n', ' ');
-      subtitles.add(Subtitle(start: start, end: end, text: text));
-    }
-    return subtitles;
+
+}
+
+List<Subtitle> _parseSrt(String srt) {
+  final List<Subtitle> subtitles = [];
+  final regex = RegExp(
+      r'(\d+)\s+(\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2},\d{3})\s+([\s\S]*?)(?=\n\n|\$)');
+  final matches = regex.allMatches(srt);
+  for (final match in matches) {
+    final start = _parseDuration(match.group(2)!);
+    final end = _parseDuration(match.group(3)!);
+    final text = match.group(4)!.trim().replaceAll('\n', ' ');
+    subtitles.add(Subtitle(start: start, end: end, text: text));
   }
+  return subtitles;
+}
+
+List<Subtitle> _parseVtt(String vtt) {
+  final List<Subtitle> subtitles = [];
+  final regex = RegExp(
+      r'(\d{2}:\d{2}:\d{2}\.\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}\.\d{3})\s+([\s\S]*?)(?=\n\n|\$)');
+  final matches = regex.allMatches(vtt);
+  for (final match in matches) {
+    final start = _parseDuration(match.group(1)!);
+    final end = _parseDuration(match.group(2)!);
+    final text = match.group(3)!.trim().replaceAll('\n', ' ');
+    subtitles.add(Subtitle(start: start, end: end, text: text));
+  }
+  return subtitles;
+}
 
   Duration _parseDuration(String timeString) {
     final parts = timeString.split(RegExp(r'[:,]'));
@@ -394,7 +454,7 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
   void _toggleControls() {
     if (!mounted || _isLocked) return;
     setState(() {
-      _showControls = true; // Only show controls, no toggle off here
+      _showControls = true;
       if (_recommendationTimer != null) {
         _recommendationTimer!.cancel();
         _showRecommendationsBar = false;
@@ -653,9 +713,17 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
                 ],
               ),
               const SizedBox(height: 12),
-              ElevatedButton(
+              Focus(
+                child: ElevatedButton(
                   onPressed: () => Navigator.pop(context),
-                  child: const Text('Close Settings')),
+                  child: const Text('Close Settings'),
+                ),
+                onFocusChange: (hasFocus) {
+                  if (hasFocus) {
+                    _startHideTimer();
+                  }
+                },
+              ),
             ],
           ),
         );
@@ -865,11 +933,26 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    IconButton(
-                      icon: Icon(Icons.arrow_back,
-                          color: _controlColor, size: _iconSize),
-                      onPressed: () {
-                        if (mounted) Navigator.pop(context);
+                    Focus(
+                      child: IconButton(
+                        icon: Icon(Icons.arrow_back,
+                            color: _controlColor, size: _iconSize),
+                        onPressed: () {
+                          if (mounted) Navigator.pop(context);
+                        },
+                      ),
+                      onFocusChange: (hasFocus) {
+                        if (hasFocus) {
+                          _startHideTimer();
+                        }
+                      },
+                      onKeyEvent: (node, event) {
+                        if (event is KeyDownEvent &&
+                            event.logicalKey == LogicalKeyboardKey.select) {
+                          if (mounted) Navigator.pop(context);
+                          return KeyEventResult.handled;
+                        }
+                        return KeyEventResult.ignored;
                       },
                     ),
                     Expanded(
@@ -885,40 +968,118 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
                     ),
                     Row(
                       children: [
-                        IconButton(
-                          icon: Icon(Icons.high_quality,
-                              color: _controlColor, size: _iconSize),
-                          onPressed: _showQualityMenu,
+                        Focus(
+                          child: IconButton(
+                            icon: Icon(Icons.high_quality,
+                                color: _controlColor, size: _iconSize),
+                            onPressed: _showQualityMenu,
+                          ),
+                          onFocusChange: (hasFocus) {
+                            if (hasFocus) {
+                              _startHideTimer();
+                            }
+                          },
+                          onKeyEvent: (node, event) {
+                            if (event is KeyDownEvent &&
+                                event.logicalKey == LogicalKeyboardKey.select) {
+                              _showQualityMenu();
+                              return KeyEventResult.handled;
+                            }
+                            return KeyEventResult.ignored;
+                          },
                         ),
-                        IconButton(
-                          icon: Icon(Icons.speed,
-                              color: _controlColor, size: _iconSize),
-                          onPressed: _showSpeedMenu,
+                        Focus(
+                          child: IconButton(
+                            icon: Icon(Icons.speed,
+                                color: _controlColor, size: _iconSize),
+                            onPressed: _showSpeedMenu,
+                          ),
+                          onFocusChange: (hasFocus) {
+                            if (hasFocus) {
+                              _startHideTimer();
+                            }
+                          },
+                          onKeyEvent: (node, event) {
+                            if (event is KeyDownEvent &&
+                                event.logicalKey == LogicalKeyboardKey.select) {
+                              _showSpeedMenu();
+                              return KeyEventResult.handled;
+                            }
+                            return KeyEventResult.ignored;
+                          },
                         ),
-                        IconButton(
-                          icon: Icon(Icons.settings,
-                              color: _controlColor, size: _iconSize),
-                          onPressed: _showSettingsMenu,
+                        Focus(
+                          child: IconButton(
+                            icon: Icon(Icons.settings,
+                                color: _controlColor, size: _iconSize),
+                            onPressed: _showSettingsMenu,
+                          ),
+                          onFocusChange: (hasFocus) {
+                            if (hasFocus) {
+                              _startHideTimer();
+                            }
+                          },
+                          onKeyEvent: (node, event) {
+                            if (event is KeyDownEvent &&
+                                event.logicalKey == LogicalKeyboardKey.select) {
+                              _showSettingsMenu();
+                              return KeyEventResult.handled;
+                            }
+                            return KeyEventResult.ignored;
+                          },
                         ),
-                        IconButton(
-                          icon: Icon(
-                              _showSubtitles
-                                  ? Icons.closed_caption
-                                  : Icons.closed_caption_off,
-                              color: _controlColor,
-                              size: _iconSize),
-                          onPressed: () {
-                            setState(() {
-                              _showSubtitles = !_showSubtitles;
-                            });
-                            _startHideTimer();
+                        Focus(
+                          child: IconButton(
+                            icon: Icon(
+                                _showSubtitles
+                                    ? Icons.closed_caption
+                                    : Icons.closed_caption_off,
+                                color: _controlColor,
+                                size: _iconSize),
+                            onPressed: () {
+                              setState(() {
+                                _showSubtitles = !_showSubtitles;
+                              });
+                              _startHideTimer();
+                            },
+                          ),
+                          onFocusChange: (hasFocus) {
+                            if (hasFocus) {
+                              _startHideTimer();
+                            }
+                          },
+                          onKeyEvent: (node, event) {
+                            if (event is KeyDownEvent &&
+                                event.logicalKey == LogicalKeyboardKey.select) {
+                              setState(() {
+                                _showSubtitles = !_showSubtitles;
+                              });
+                              _startHideTimer();
+                              return KeyEventResult.handled;
+                            }
+                            return KeyEventResult.ignored;
                           },
                         ),
                         if (widget.isFullSeason)
-                          IconButton(
-                            icon: Icon(Icons.list,
-                                color: _controlColor, size: _iconSize),
-                            onPressed: _showEpisodeMenu,
+                          Focus(
+                            child: IconButton(
+                              icon: Icon(Icons.list,
+                                  color: _controlColor, size: _iconSize),
+                              onPressed: _showEpisodeMenu,
+                            ),
+                            onFocusChange: (hasFocus) {
+                              if (hasFocus) {
+                                _startHideTimer();
+                              }
+                            },
+                            onKeyEvent: (node, event) {
+                              if (event is KeyDownEvent &&
+                                  event.logicalKey == LogicalKeyboardKey.select) {
+                                _showEpisodeMenu();
+                                return KeyEventResult.handled;
+                              }
+                              return KeyEventResult.ignored;
+                            },
                           ),
                       ],
                     ),
@@ -950,45 +1111,106 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceEvenly,
               children: [
-                IconButton(
-                  iconSize: _iconSize,
-                  icon: Icon(Icons.replay_10, color: _controlColor),
-                  onPressed: () {
-                    final newPos = _controller.value.position -
-                        const Duration(seconds: 10);
-                    _controller.seekTo(
-                        newPos > Duration.zero ? newPos : Duration.zero);
-                    _startHideTimer();
-                  },
-                ),
-                IconButton(
-                  iconSize: _iconSize + 24,
-                  icon: Icon(
-                      _controller.value.isPlaying
-                          ? Icons.pause_circle_filled
-                          : Icons.play_circle_filled,
-                      color: _controlColor),
-                  onPressed: () {
-                    setState(() {
-                      if (_controller.value.isPlaying) {
-                        _controller.pause();
-                      } else {
-                        _controller.play();
-                      }
-                    });
-                    _startHideTimer();
-                  },
-                ),
-                IconButton(
-                  iconSize: _iconSize,
-                  icon: Icon(Icons.forward_10, color: _controlColor),
-                  onPressed: () {
-                    final newPos = _controller.value.position +
-                        const Duration(seconds: 10);
-                    if (newPos < _controller.value.duration) {
-                      _controller.seekTo(newPos);
+                Focus(
+                  child: IconButton(
+                    iconSize: _iconSize,
+                    icon: Icon(Icons.replay_10, color: _controlColor),
+                    onPressed: () {
+                      final newPos = _controller.value.position -
+                          const Duration(seconds: 10);
+                      _controller.seekTo(
+                          newPos > Duration.zero ? newPos : Duration.zero);
+                      _startHideTimer();
+                    },
+                  ),
+                  onFocusChange: (hasFocus) {
+                    if (hasFocus) {
+                      _startHideTimer();
                     }
-                    _startHideTimer();
+                  },
+                  onKeyEvent: (node, event) {
+                    if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.select) {
+                      final newPos = _controller.value.position -
+                          const Duration(seconds: 10);
+                      _controller.seekTo(
+                          newPos > Duration.zero ? newPos : Duration.zero);
+                      _startHideTimer();
+                      return KeyEventResult.handled;
+                    }
+                    return KeyEventResult.ignored;
+                  },
+                ),
+                Focus(
+                  child: IconButton(
+                    iconSize: _iconSize + 24,
+                    icon: Icon(
+                        _controller.value.isPlaying
+                            ? Icons.pause_circle_filled
+                            : Icons.play_circle_filled,
+                        color: _controlColor),
+                    onPressed: () {
+                      setState(() {
+                        if (_controller.value.isPlaying) {
+                          _controller.pause();
+                        } else {
+                          _controller.play();
+                        }
+                      });
+                      _startHideTimer();
+                    },
+                  ),
+                  onFocusChange: (hasFocus) {
+                    if (hasFocus) {
+                      _startHideTimer();
+                    }
+                  },
+                  onKeyEvent: (node, event) {
+                    if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.select) {
+                      setState(() {
+                        if (_controller.value.isPlaying) {
+                          _controller.pause();
+                        } else {
+                          _controller.play();
+                        }
+                      });
+                      _startHideTimer();
+                      return KeyEventResult.handled;
+                    }
+                    return KeyEventResult.ignored;
+                  },
+                ),
+                Focus(
+                  child: IconButton(
+                    iconSize: _iconSize,
+                    icon: Icon(Icons.forward_10, color: _controlColor),
+                    onPressed: () {
+                      final newPos = _controller.value.position +
+                          const Duration(seconds: 10);
+                      if (newPos < _controller.value.duration) {
+                        _controller.seekTo(newPos);
+                      }
+                      _startHideTimer();
+                    },
+                  ),
+                  onFocusChange: (hasFocus) {
+                    if (hasFocus) {
+                      _startHideTimer();
+                    }
+                  },
+                  onKeyEvent: (node, event) {
+                    if (event is KeyDownEvent &&
+                        event.logicalKey == LogicalKeyboardKey.select) {
+                      final newPos = _controller.value.position +
+                          const Duration(seconds: 10);
+                      if (newPos < _controller.value.duration) {
+                        _controller.seekTo(newPos);
+                      }
+                      _startHideTimer();
+                      return KeyEventResult.handled;
+                    }
+                    return KeyEventResult.ignored;
                   },
                 ),
               ],
@@ -1021,10 +1243,27 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
                           : 'Loading next episode...',
                       style: const TextStyle(color: Colors.white, fontSize: 16),
                     ),
-                    ElevatedButton(
+                    Focus(
+                      child: ElevatedButton(
                         onPressed:
                             _nextEpisodeData != null ? _playNextEpisode : null,
-                        child: const Text('Play Now')),
+                        child: const Text('Play Now'),
+                      ),
+                      onFocusChange: (hasFocus) {
+                        if (hasFocus) {
+                          _startHideTimer();
+                        }
+                      },
+                      onKeyEvent: (node, event) {
+                        if (event is KeyDownEvent &&
+                            event.logicalKey == LogicalKeyboardKey.select &&
+                            _nextEpisodeData != null) {
+                          _playNextEpisode();
+                          return KeyEventResult.handled;
+                        }
+                        return KeyEventResult.ignored;
+                      },
+                    ),
                   ],
                 ),
               ),
@@ -1045,9 +1284,25 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
                     Text('Up Next: ${_recommendationData!['title']}',
                         style:
                             const TextStyle(color: Colors.white, fontSize: 16)),
-                    ElevatedButton(
+                    Focus(
+                      child: ElevatedButton(
                         onPressed: _playRecommendedMovie,
-                        child: const Text('Play Now')),
+                        child: const Text('Play Now'),
+                      ),
+                      onFocusChange: (hasFocus) {
+                        if (hasFocus) {
+                          _startHideTimer();
+                        }
+                      },
+                      onKeyEvent: (node, event) {
+                        if (event is KeyDownEvent &&
+                            event.logicalKey == LogicalKeyboardKey.select) {
+                          _playRecommendedMovie();
+                          return KeyEventResult.handled;
+                        }
+                        return KeyEventResult.ignored;
+                      },
+                    ),
                   ],
                 ),
               ),
@@ -1083,63 +1338,178 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
                             style:
                                 TextStyle(color: _controlColor, fontSize: 14)),
                         const Spacer(),
-                        IconButton(
-                          icon: Icon(
-                              _isMuted ? Icons.volume_off : Icons.volume_up,
-                              color: _controlColor,
-                              size: _iconSize),
-                          onPressed: () {
-                            showDialog(
-                              context: context,
-                              builder: (context) => AlertDialog(
-                                backgroundColor: Colors.black87,
-                                title: const Text('Volume',
-                                    style: TextStyle(color: Colors.white)),
-                                content: Slider(
-                                  value: _volume,
-                                  onChanged: (value) {
-                                    setState(() {
-                                      _volume = value;
-                                      _controller.setVolume(value);
-                                      _isMuted = value == 0;
-                                    });
-                                  },
-                                  min: 0,
-                                  max: 1,
-                                  divisions: 20,
-                                  activeColor: Colors.deepPurpleAccent,
+                        Focus(
+                          child: IconButton(
+                            icon: Icon(
+                                _isMuted ? Icons.volume_off : Icons.volume_up,
+                                color: _controlColor,
+                                size: _iconSize),
+                            onPressed: () {
+                              showDialog(
+                                context: context,
+                                builder: (context) => AlertDialog(
+                                  backgroundColor: Colors.black87,
+                                  title: const Text('Volume',
+                                      style: TextStyle(color: Colors.white)),
+                                  content: Slider(
+                                    value: _volume,
+                                    onChanged: (value) {
+                                      setState(() {
+                                        _volume = value;
+                                        _controller.setVolume(value);
+                                        _isMuted = value == 0;
+                                      });
+                                    },
+                                    min: 0,
+                                    max: 1,
+                                    divisions: 20,
+                                    activeColor: Colors.deepPurpleAccent,
+                                  ),
+                                  actions: [
+                                    Focus(
+                                      child: TextButton(
+                                          onPressed: () =>
+                                              Navigator.pop(context),
+                                          child: const Text('Close',
+                                              style: TextStyle(
+                                                  color: Colors.white))),
+                                      onFocusChange: (hasFocus) {
+                                        if (hasFocus) {
+                                          _startHideTimer();
+                                        }
+                                      },
+                                      onKeyEvent: (node, event) {
+                                        if (event is KeyDownEvent &&
+                                            event.logicalKey ==
+                                                LogicalKeyboardKey.select) {
+                                          Navigator.pop(context);
+                                          return KeyEventResult.handled;
+                                        }
+                                        return KeyEventResult.ignored;
+                                      },
+                                    ),
+                                  ],
                                 ),
-                                actions: [
-                                  TextButton(
-                                      onPressed: () => Navigator.pop(context),
-                                      child: const Text('Close',
-                                          style:
-                                              TextStyle(color: Colors.white))),
-                                ],
-                              ),
-                            ).whenComplete(_startHideTimer);
-                          },
-                        ),
-                        IconButton(
-                          icon: Icon(Icons.lock,
-                              color: _controlColor, size: _iconSize),
-                          onPressed: () {
-                            setState(() {
-                              _isLocked = true;
-                            });
-                            _startHideTimer();
-                          },
-                        ),
-                        IconButton(
-                          icon: Icon(Icons.fullscreen,
-                              color: _controlColor, size: _iconSize),
-                          onPressed: () {
-                            if (mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(
-                                      content: Text("Fullscreen toggled")));
+                              ).whenComplete(_startHideTimer);
+                            },
+                          ),
+                          onFocusChange: (hasFocus) {
+                            if (hasFocus) {
+                              _startHideTimer();
                             }
-                            _startHideTimer();
+                          },
+                          onKeyEvent: (node, event) {
+                            if (event is KeyDownEvent &&
+                                event.logicalKey == LogicalKeyboardKey.select) {
+                              showDialog(
+                                context: context,
+                                builder: (context) => AlertDialog(
+                                  backgroundColor: Colors.black87,
+                                  title: const Text('Volume',
+                                      style: TextStyle(color: Colors.white)),
+                                  content: Slider(
+                                    value: _volume,
+                                    onChanged: (value) {
+                                      setState(() {
+                                        _volume = value;
+                                        _controller.setVolume(value);
+                                        _isMuted = value == 0;
+                                      });
+                                    },
+                                    min: 0,
+                                    max: 1,
+                                    divisions: 20,
+                                    activeColor: Colors.deepPurpleAccent,
+                                  ),
+                                  actions: [
+                                    Focus(
+                                      child: TextButton(
+                                          onPressed: () =>
+                                              Navigator.pop(context),
+                                          child: const Text('Close',
+                                              style: TextStyle(
+                                                  color: Colors.white))),
+                                      onFocusChange: (hasFocus) {
+                                        if (hasFocus) {
+                                          _startHideTimer();
+                                        }
+                                      },
+                                      onKeyEvent: (node, event) {
+                                        if (event is KeyDownEvent &&
+                                            event.logicalKey ==
+                                                LogicalKeyboardKey.select) {
+                                          Navigator.pop(context);
+                                          return KeyEventResult.handled;
+                                        }
+                                        return KeyEventResult.ignored;
+                                      },
+                                    ),
+                                  ],
+                                ),
+                              ).whenComplete(_startHideTimer);
+                              return KeyEventResult.handled;
+                            }
+                            return KeyEventResult.ignored;
+                          },
+                        ),
+                        Focus(
+                          child: IconButton(
+                            icon: Icon(Icons.lock,
+                                color: _controlColor, size: _iconSize),
+                            onPressed: () {
+                              setState(() {
+                                _isLocked = true;
+                              });
+                              _startHideTimer();
+                            },
+                          ),
+                          onFocusChange: (hasFocus) {
+                            if (hasFocus) {
+                              _startHideTimer();
+                            }
+                          },
+                          onKeyEvent: (node, event) {
+                            if (event is KeyDownEvent &&
+                                event.logicalKey == LogicalKeyboardKey.select) {
+                              setState(() {
+                                _isLocked = true;
+                              });
+                              _startHideTimer();
+                              return KeyEventResult.handled;
+                            }
+                            return KeyEventResult.ignored;
+                          },
+                        ),
+                        Focus(
+                          child: IconButton(
+                            icon: Icon(Icons.fullscreen,
+                                color: _controlColor, size: _iconSize),
+                            onPressed: () {
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                        content: Text("Fullscreen toggled")));
+                              }
+                              _startHideTimer();
+                            },
+                          ),
+                          onFocusChange: (hasFocus) {
+                            if (hasFocus) {
+                              _startHideTimer();
+                            }
+                          },
+                          onKeyEvent: (node, event) {
+                            if (event is KeyDownEvent &&
+                                event.logicalKey == LogicalKeyboardKey.select) {
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                        content: Text("Fullscreen toggled")));
+                              }
+                              _startHideTimer();
+                              return KeyEventResult.handled;
+                            }
+                            return KeyEventResult.ignored;
                           },
                         ),
                         const SizedBox(width: 8),
@@ -1171,116 +1541,151 @@ class MainVideoPlayerState extends State<MainVideoPlayer>
                       style: const TextStyle(color: Colors.red, fontSize: 16),
                       textAlign: TextAlign.center),
                   const SizedBox(height: 16),
-                  ElevatedButton(
-                      onPressed: _retryLoad, child: const Text('Retry')),
+                  Focus(
+                    child: ElevatedButton(
+                      onPressed: _retryLoad,
+                      child: const Text('Retry'),
+                    ),
+                    onFocusChange: (hasFocus) {
+                      if (hasFocus) {
+                        _startHideTimer();
+                      }
+                    },
+                    onKeyEvent: (node, event) {
+                      if (event is KeyDownEvent &&
+                          event.logicalKey == LogicalKeyboardKey.select) {
+                        _retryLoad();
+                        return KeyEventResult.handled;
+                      }
+                      return KeyEventResult.ignored;
+                    },
+                  ),
                 ],
               ),
             )
           : _isInitialized
-              ? GestureDetector(
-                  onTap: _isLocked
-                      ? null
-                      : _toggleControls, // Single tap only shows controls
-                  onDoubleTap: _isLocked
-                      ? null
-                      : () {
-                          if (_lastTapPosition == null) return;
-                          final screenWidth = MediaQuery.of(context).size.width;
-                          final tapX = _lastTapPosition!.dx;
-                          if (tapX < screenWidth / 3) {
-                            final newPos = _controller.value.position -
-                                const Duration(seconds: 10);
-                            _controller.seekTo(newPos > Duration.zero
-                                ? newPos
-                                : Duration.zero);
-                            setState(() {
-                              _seekFeedback = "-10s";
-                            });
-                          } else if (tapX > screenWidth * 2 / 3) {
-                            final newPos = _controller.value.position +
-                                const Duration(seconds: 10);
-                            if (newPos < _controller.value.duration) {
-                              _controller.seekTo(newPos);
-                            }
-                            setState(() {
-                              _seekFeedback = "+10s";
-                            });
-                          }
-                          _lastTapPosition = null;
-                          Timer(const Duration(seconds: 1), () {
-                            if (mounted) {
+              ? FocusScope(
+                  child: GestureDetector(
+                    onTap: _isLocked ? null : _toggleControls,
+                    onDoubleTap: _isLocked
+                        ? null
+                        : () {
+                            if (_lastTapPosition == null) return;
+                            final screenWidth = MediaQuery.of(context).size.width;
+                            final tapX = _lastTapPosition!.dx;
+                            if (tapX < screenWidth / 3) {
+                              final newPos = _controller.value.position -
+                                  const Duration(seconds: 10);
+                              _controller.seekTo(newPos > Duration.zero
+                                  ? newPos
+                                  : Duration.zero);
                               setState(() {
-                                _seekFeedback = null;
+                                _seekFeedback = "-10s";
+                              });
+                            } else if (tapX > screenWidth * 2 / 3) {
+                              final newPos = _controller.value.position +
+                                  const Duration(seconds: 10);
+                              if (newPos < _controller.value.duration) {
+                                _controller.seekTo(newPos);
+                              }
+                              setState(() {
+                                _seekFeedback = "+10s";
                               });
                             }
-                          });
-                        },
-                  onTapDown: _isLocked
-                      ? null
-                      : (details) => _lastTapPosition = details.globalPosition,
-                  onHorizontalDragStart:
-                      _isLocked ? null : _onHorizontalDragStart,
-                  onHorizontalDragUpdate:
-                      _isLocked ? null : _onHorizontalDragUpdate,
-                  onHorizontalDragEnd: _isLocked ? null : _onHorizontalDragEnd,
-                  onVerticalDragStart: _isLocked ? null : _onVerticalDragStart,
-                  onVerticalDragUpdate:
-                      _isLocked ? null : _onVerticalDragUpdate,
-                  onVerticalDragEnd: _isLocked ? null : _onVerticalDragEnd,
-                  child: Stack(
-                    children: [
-                      SizedBox.expand(
-                        child: FittedBox(
-                          fit: BoxFit.contain,
-                          child: SizedBox(
-                              width: _controller.value.size.width,
-                              height: _controller.value.size.height,
-                              child: VideoPlayer(_controller)),
-                        ),
-                      ),
-                      if (_isBuffering)
-                        const Center(child: CircularProgressIndicator()),
-                      if (_isLocked)
-                        Center(
-                          child: IconButton(
-                            icon: Icon(Icons.lock,
-                                color: _controlColor, size: _iconSize + 10),
-                            onPressed: () {
-                              setState(() {
-                                _isLocked = false;
-                              });
-                            },
-                          ),
-                        )
-                      else
-                        _buildControls(),
-                      if (_isAdjustingBrightness && !kIsWeb)
-                        Positioned(
-                          left: 16,
-                          top: MediaQuery.of(context).size.height / 2 - 50,
-                          child: Column(
-                            children: [
-                              const Icon(Icons.brightness_6,
-                                  color: Colors.white, size: 32),
-                              Text('${(_brightness * 100).round()}%',
-                                  style: const TextStyle(color: Colors.white)),
-                            ],
+                            _lastTapPosition = null;
+                            Timer(const Duration(seconds: 1), () {
+                              if (mounted) {
+                                setState(() {
+                                  _seekFeedback = null;
+                                });
+                              }
+                            });
+                          },
+                    onTapDown: _isLocked
+                        ? null
+                        : (details) => _lastTapPosition = details.globalPosition,
+                    onHorizontalDragStart:
+                        _isLocked ? null : _onHorizontalDragStart,
+                    onHorizontalDragUpdate:
+                        _isLocked ? null : _onHorizontalDragUpdate,
+                    onHorizontalDragEnd: _isLocked ? null : _onHorizontalDragEnd,
+                    onVerticalDragStart: _isLocked ? null : _onVerticalDragStart,
+                    onVerticalDragUpdate:
+                        _isLocked ? null : _onVerticalDragUpdate,
+                    onVerticalDragEnd: _isLocked ? null : _onVerticalDragEnd,
+                    child: Stack(
+                      children: [
+                        SizedBox.expand(
+                          child: FittedBox(
+                            fit: BoxFit.contain,
+                            child: SizedBox(
+                                width: _controller.value.size.width,
+                                height: _controller.value.size.height,
+                                child: VideoPlayer(_controller)),
                           ),
                         ),
-                      if (_isAdjustingVolume)
-                        Positioned(
-                          right: 16,
-                          top: MediaQuery.of(context).size.height / 2 - 50,
-                          child: Column(
-                            children: [
-                              const Icon(Icons.volume_up,
-                                  color: Colors.white, size: 32),
-                              Text('${(_volume * 100).round()}%',
-                                  style: const TextStyle(color: Colors.white)),
-                            ],
+                        if (_isBuffering)
+                          const Center(child: CircularProgressIndicator()),
+                        if (_isLocked)
+                          Center(
+                            child: Focus(
+                              child: IconButton(
+                                icon: Icon(Icons.lock,
+                                    color: _controlColor, size: _iconSize + 10),
+                                onPressed: () {
+                                  setState(() {
+                                    _isLocked = false;
+                                  });
+                                },
+                              ),
+                              onFocusChange: (hasFocus) {
+                                if (hasFocus) {
+                                  _startHideTimer();
+                                }
+                              },
+                              onKeyEvent: (node, event) {
+                                if (event is KeyDownEvent &&
+                                    event.logicalKey ==
+                                        LogicalKeyboardKey.select) {
+                                  setState(() {
+                                    _isLocked = false;
+                                  });
+                                  return KeyEventResult.handled;
+                                }
+                                return KeyEventResult.ignored;
+                              },
+                            ),
+                          )
+                        else
+                          _buildControls(),
+                        if (_isAdjustingBrightness && !kIsWeb)
+                          Positioned(
+                            left: 16,
+                            top: MediaQuery.of(context).size.height / 2 - 50,
+                            child: Column(
+                              children: [
+                                const Icon(Icons.brightness_6,
+                                    color: Colors.white, size: 32),
+                                Text('${(_brightness * 100).round()}%',
+                                    style: const TextStyle(color: Colors.white)),
+                              ],
+                            ),
                           ),
-                        ),
-                    ],
+                        if (_isAdjustingVolume)
+                          Positioned(
+                            right: 16,
+                            top: MediaQuery.of(context).size.height / 2 - 50,
+                            child: Column(
+                              children: [
+                                const Icon(Icons.volume_up,
+                                    color: Colors.white, size: 32),
+                                Text('${(_volume * 100).round()}%',
+                                    style: const TextStyle(color: Colors.white)),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 )
               : const Center(child: CircularProgressIndicator()),
